@@ -7,6 +7,8 @@ time-synchronized lyrics from **LRCLIB** (free, no API key), and falls back
 to scraping plain lyrics from **Genius** when no synced version exists.
 Synced lines highlight and auto-scroll in time with playback.
 
+![croon auto-scrolling synced lyrics in the terminal](assets/demo.gif)
+
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="assets/screenshot-dark.png">
   <source media="(prefers-color-scheme: light)" srcset="assets/screenshot-light.png">
