@@ -5,7 +5,7 @@ time-synchronized lyrics from LRCLIB (free, no API key), and falls back to
 scraping plain lyrics from Genius when no synced version exists.
 
 Run:  croon  (or: uvx croon)
-Keys: q quit · r refresh · +/- sync offset · f toggle follow · h footer · l lyrics only · o open in Genius
+Keys: q quit · r refresh · s search · +/- sync offset · f toggle follow · h footer · l lyrics only · o open in Genius
 """
 
 from __future__ import annotations
@@ -25,6 +25,7 @@ import time
 import webbrowser
 from bisect import bisect_right
 from dataclasses import dataclass, field
+from difflib import SequenceMatcher
 
 import httpx
 from PIL import Image
@@ -32,7 +33,7 @@ from textual import events
 from textual.app import App, ComposeResult
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.timer import Timer
-from textual.widgets import Footer, Static
+from textual.widgets import Footer, Input, Static
 from textual_image.widget import TGPImage
 
 USER_AGENT = "croon/0.1 (https://github.com/saforem2/croon)"
@@ -292,6 +293,24 @@ async def fetch_lrclib(client: httpx.AsyncClient, track: Track) -> Lyrics | None
     return None
 
 
+def _normalized_words(value: str) -> set[str]:
+    """Return words suitable for conservative search-result matching."""
+    value = re.sub(r"\([^)]*\)|\[[^]]*\]", " ", value.casefold())
+    return set(re.findall(r"[a-z0-9]+", value))
+
+
+def _similar_enough(expected: str, actual: str) -> bool:
+    """Reject unrelated fuzzy hits while allowing common title suffixes."""
+    left, right = _normalized_words(expected), _normalized_words(actual)
+    if not left or not right:
+        return False
+    overlap = len(left & right) / len(left)
+    ratio = SequenceMatcher(
+        None, " ".join(sorted(left)), " ".join(sorted(right))
+    ).ratio()
+    return overlap >= 0.6 or ratio >= 0.72
+
+
 def _extract_lyrics_containers(page: str) -> str:
     """Pull text out of Genius's `data-lyrics-container` divs (depth-aware)."""
     chunks: list[str] = []
@@ -317,9 +336,11 @@ def _extract_lyrics_containers(page: str) -> str:
     return "\n".join(out).strip()
 
 
-async def fetch_genius_url(client: httpx.AsyncClient, track: Track) -> str | None:
+async def fetch_genius_url(
+    client: httpx.AsyncClient, track: Track, query: str | None = None
+) -> str | None:
     """Find the Genius song page URL for a track."""
-    q = f"{track.artist} {track.title}".strip()
+    q = query or f"{track.artist} {track.title}".strip()
     try:
         r = await client.get(
             "https://genius.com/api/search/multi", params={"q": q}
@@ -331,13 +352,19 @@ async def fetch_genius_url(client: httpx.AsyncClient, track: Track) -> str | Non
     for section in data.get("response", {}).get("sections", []):
         for hit in section.get("hits", []):
             result = hit.get("result", {})
-            if hit.get("type") == "song" and result.get("url"):
+            if hit.get("type") != "song" or not result.get("url"):
+                continue
+            # Genius search is fuzzy and may return an unrelated first song,
+            # especially for ads or podcasts with no artist metadata.
+            if query or _similar_enough(track.title, str(result.get("title") or "")):
                 return result["url"]
     return None
 
 
-async def fetch_genius(client: httpx.AsyncClient, track: Track) -> Lyrics | None:
-    url = await fetch_genius_url(client, track)
+async def fetch_genius(
+    client: httpx.AsyncClient, track: Track, query: str | None = None
+) -> Lyrics | None:
+    url = await fetch_genius_url(client, track, query=query)
     if not url:
         return None
     try:
@@ -353,6 +380,13 @@ async def fetch_genius(client: httpx.AsyncClient, track: Track) -> Lyrics | None
 
 async def fetch_lyrics(client: httpx.AsyncClient, track: Track) -> Lyrics | None:
     return await fetch_lrclib(client, track) or await fetch_genius(client, track)
+
+
+async def search_lyrics(
+    client: httpx.AsyncClient, track: Track, query: str
+) -> Lyrics | None:
+    """Fetch lyrics using a user-supplied Genius search query."""
+    return await fetch_genius(client, track, query=query)
 
 
 # --------------------------------------------------------------------------
@@ -469,6 +503,8 @@ class Croon(App):
     #lyrics { height: 1fr; padding: 1 4; overflow-y: scroll; scrollbar-size-vertical: 0; }
     #lyrics.scrollbar-visible { scrollbar-size-vertical: 2; }
     #lyrics.lyrics-only { scrollbar-size-vertical: 0; }
+    #search { display: none; dock: bottom; margin: 0 2 1 2; }
+    #search.visible { display: block; }
     LyricLine { width: 100%; text-align: left; color: $text-muted; }
     LyricLine.past { color: $text-muted; text-style: dim; }
     LyricLine.current { color: ansi_blue; text-style: bold; }
@@ -478,6 +514,8 @@ class Croon(App):
     BINDINGS = [
         ("q", "quit", "Quit"),
         ("r", "refresh", "Refresh"),
+        ("s", "search", "Search"),
+        ("escape", "cancel_search", "Cancel search"),
         ("plus,equals_sign", "offset(0.5)", "Delay +0.5s"),
         ("minus", "offset(-0.5)", "Delay -0.5s"),
         ("f", "toggle_follow", "Follow"),
@@ -528,6 +566,7 @@ class Croon(App):
         yield VerticalScroll(
             Static("Nothing playing yet.", classes="message"), id="lyrics"
         )
+        yield Input(placeholder="Search Genius (artist and song title)", id="search")
         yield Footer(id="footer")
 
     def on_mount(self) -> None:
@@ -579,16 +618,23 @@ class Croon(App):
                 self._genius_task.cancel()
             self._genius_task = asyncio.create_task(self.load_genius_url(track))
 
-    async def load_lyrics(self, track: Track) -> None:
+    async def load_lyrics(self, track: Track, query: str | None = None) -> None:
         try:
-            lyrics = await fetch_lyrics(self.client, track)
+            lyrics = (
+                await search_lyrics(self.client, track, query)
+                if query
+                else await fetch_lyrics(self.client, track)
+            )
         except asyncio.CancelledError:
             return
         if self.track and self.track.key == track.key:
             self.lyrics = lyrics
             if lyrics is None:
-                self.show_message("No lyrics found for this track.")
+                suffix = f' for “{query}”.' if query else " for this track."
+                self.show_message(f"No lyrics found{suffix}")
             else:
+                if lyrics.source.startswith("Genius"):
+                    self.genius_url = lyrics.url
                 await self.show_lyrics(lyrics)
 
     async def load_genius_url(self, track: Track) -> None:
@@ -752,6 +798,22 @@ class Croon(App):
         if event.key in {"up", "down", "pageup", "pagedown", "home", "end"}:
             self.show_scrollbar_temporarily()
 
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        if event.input.id != "search":
+            return
+        query = event.value.strip()
+        self.action_cancel_search()
+        if not query or not self.track:
+            if not self.track:
+                self.notify("Nothing playing.", severity="warning")
+            return
+        track = self.track
+        self.lyrics = None
+        self.show_message(f'Searching for “{query}”…')
+        if self._fetch_task:
+            self._fetch_task.cancel()
+        self._fetch_task = asyncio.create_task(self.load_lyrics(track, query=query))
+
     # -- actions -------------------------------------------------------------
 
     def action_refresh(self) -> None:
@@ -762,6 +824,22 @@ class Croon(App):
             if self._fetch_task:
                 self._fetch_task.cancel()
             self._fetch_task = asyncio.create_task(self.load_lyrics(track))
+
+    def action_search(self) -> None:
+        if not self.track:
+            self.notify("Nothing playing.", severity="warning")
+            return
+        search = self.query_one("#search", Input)
+        search.value = " ".join(filter(None, (self.track.artist, self.track.title)))
+        search.set_class(True, "visible")
+        search.focus()
+        search.select_all()
+
+    def action_cancel_search(self) -> None:
+        search = self.query_one("#search", Input)
+        search.set_class(False, "visible")
+        if search.has_focus:
+            search.blur()
 
     def action_offset(self, delta: float) -> None:
         self.offset = round(self.offset + delta, 1)

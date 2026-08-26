@@ -12,6 +12,7 @@ from croon.app import (
     Croon,
     Track,
     _extract_lyrics_containers,
+    _similar_enough,
     decode_album_art_image,
     fetch_genius_url,
     fmt_delay,
@@ -54,6 +55,14 @@ def test_extract_lyrics_containers():
     assert "nested" in text
     assert "junk" not in text
     assert "\n\n\n" not in text
+
+
+def test_genius_match_rejects_unrelated_result():
+    assert not _similar_enough(
+        "Sleeper - Fantasy Football, Basketball, Esports",
+        "We Have Not Quite Decided",
+    )
+    assert _similar_enough("Karma Police - Remastered", "Karma Police")
 
 
 def test_track_position_extrapolation():
@@ -208,7 +217,10 @@ async def test_fetch_genius_url_returns_song_url():
             "sections": [
                 {
                     "hits": [
-                        {"type": "song", "result": {"url": "https://genius.com/song"}},
+                        {
+                            "type": "song",
+                            "result": {"title": "a", "url": "https://genius.com/song"},
+                        },
                     ]
                 }
             ]
@@ -230,11 +242,40 @@ async def test_fetch_genius_url_returns_none_when_no_song():
 
 
 @pytest.mark.anyio
+async def test_fetch_genius_url_skips_unrelated_automatic_hit():
+    payload = {
+        "response": {"sections": [{"hits": [{
+            "type": "song",
+            "result": {"title": "Totally Different", "url": "https://genius.com/wrong"},
+        }]}]}
+    }
+    client = _FakeClient(payload)
+    track = Track(title="Karma Police", artist="Radiohead")
+    assert await fetch_genius_url(client, track) is None
+
+
+@pytest.mark.anyio
+async def test_fetch_genius_url_accepts_manual_query_result():
+    payload = {
+        "response": {"sections": [{"hits": [{
+            "type": "song",
+            "result": {"title": "Different API Label", "url": "https://genius.com/chosen"},
+        }]}]}
+    }
+    client = _FakeClient(payload)
+    url = await fetch_genius_url(
+        client, Track(title="bad metadata", artist=""), query="Radiohead Karma Police"
+    )
+    assert url == "https://genius.com/chosen"
+    assert client.calls[0][1] == {"q": "Radiohead Karma Police"}
+
+
+@pytest.mark.anyio
 async def test_load_genius_url_sets_url_for_current_track():
     payload = {
         "response": {
             "sections": [
-                {"hits": [{"type": "song", "result": {"url": "https://genius.com/x"}}]}
+                {"hits": [{"type": "song", "result": {"title": "a", "url": "https://genius.com/x"}}]}
             ]
         }
     }
@@ -252,7 +293,7 @@ async def test_load_genius_url_ignores_stale_track():
     payload = {
         "response": {
             "sections": [
-                {"hits": [{"type": "song", "result": {"url": "https://genius.com/x"}}]}
+                {"hits": [{"type": "song", "result": {"title": "old", "url": "https://genius.com/x"}}]}
             ]
         }
     }
