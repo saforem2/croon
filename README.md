@@ -48,11 +48,15 @@ terminal.
 |-------|------------------------------------------|
 | `q`   | Quit                                     |
 | `r`   | Refetch lyrics                           |
+| `s`   | Edit/search for the current song on Genius |
 | `+`/`-` | Nudge sync offset ±0.5 s               |
 | `f`   | Toggle auto-follow (free scrolling)      |
 | `h`   | Toggle footer                            |
 | `l`   | Toggle lyrics-only mode                  |
 | `o`   | Open the song's Genius page in a browser |
+
+If player metadata is missing or incorrect, press `s`, edit the pre-filled
+artist/title query, and press Enter. Press Escape to cancel the search.
 
 ## Behavior notes
 
