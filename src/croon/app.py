@@ -296,7 +296,7 @@ async def fetch_lrclib(client: httpx.AsyncClient, track: Track) -> Lyrics | None
 def _normalized_words(value: str) -> set[str]:
     """Return words suitable for conservative search-result matching."""
     value = re.sub(r"\([^)]*\)|\[[^]]*\]", " ", value.casefold())
-    return set(re.findall(r"[a-z0-9]+", value))
+    return set(re.findall(r"[^\W_]+", value))
 
 
 def _similar_enough(expected: str, actual: str) -> bool:
@@ -305,10 +305,11 @@ def _similar_enough(expected: str, actual: str) -> bool:
     if not left or not right:
         return False
     overlap = len(left & right) / len(left)
-    ratio = SequenceMatcher(
+    if overlap >= 0.6:
+        return True
+    return SequenceMatcher(
         None, " ".join(sorted(left)), " ".join(sorted(right))
-    ).ratio()
-    return overlap >= 0.6 or ratio >= 0.72
+    ).ratio() >= 0.72
 
 
 def _extract_lyrics_containers(page: str) -> str:
@@ -812,6 +813,9 @@ class Croon(App):
         self.show_message(f'Searching for “{query}”…')
         if self._fetch_task:
             self._fetch_task.cancel()
+        if self._genius_task:
+            self._genius_task.cancel()
+            self._genius_task = None
         self._fetch_task = asyncio.create_task(self.load_lyrics(track, query=query))
 
     # -- actions -------------------------------------------------------------

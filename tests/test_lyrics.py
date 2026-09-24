@@ -1,3 +1,4 @@
+import asyncio
 import base64
 import io
 import time
@@ -6,7 +7,7 @@ import pytest
 from PIL import Image
 
 from textual.containers import VerticalScroll
-from textual.widgets import Footer, Static
+from textual.widgets import Footer, Input, Static
 
 from croon.app import (
     Croon,
@@ -63,6 +64,7 @@ def test_genius_match_rejects_unrelated_result():
         "We Have Not Quite Decided",
     )
     assert _similar_enough("Karma Police - Remastered", "Karma Police")
+    assert _similar_enough("夢の中へ", "夢の中へ (Remastered)")
 
 
 def test_track_position_extrapolation():
@@ -303,6 +305,38 @@ async def test_load_genius_url_ignores_stale_track():
         app.track = Track(title="new", artist="new")
         await app.load_genius_url(Track(title="old", artist="old"))
         assert app.genius_url is None
+
+
+@pytest.mark.anyio
+async def test_manual_search_cancels_automatic_genius_lookup(monkeypatch):
+    app = Croon()
+    async with app.run_test():
+        track = Track(title="bad metadata", artist="")
+        app.track = track
+        automatic_started = asyncio.Event()
+
+        async def automatic_lookup(_track):
+            automatic_started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                app.genius_url = "https://genius.com/automatic"
+                raise
+
+        async def manual_lookup(_track, query=None):
+            app.genius_url = "https://genius.com/manual"
+
+        app._genius_task = asyncio.create_task(automatic_lookup(track))
+        await automatic_started.wait()
+        monkeypatch.setattr(app, "load_lyrics", manual_lookup)
+
+        search = app.query_one("#search", Input)
+        search.value = "Radiohead Karma Police"
+        app.on_input_submitted(Input.Submitted(search, search.value))
+        await asyncio.sleep(0)
+
+        assert app._genius_task is None
+        assert app.genius_url == "https://genius.com/manual"
 
 
 @pytest.mark.anyio
