@@ -1,3 +1,4 @@
+import asyncio
 import base64
 import io
 import time
@@ -6,12 +7,13 @@ import pytest
 from PIL import Image
 
 from textual.containers import VerticalScroll
-from textual.widgets import Footer, Static
+from textual.widgets import Footer, Input, Static
 
 from croon.app import (
     Croon,
     Track,
     _extract_lyrics_containers,
+    _similar_enough,
     decode_album_art_image,
     fetch_genius_url,
     fmt_delay,
@@ -54,6 +56,15 @@ def test_extract_lyrics_containers():
     assert "nested" in text
     assert "junk" not in text
     assert "\n\n\n" not in text
+
+
+def test_genius_match_rejects_unrelated_result():
+    assert not _similar_enough(
+        "Sleeper - Fantasy Football, Basketball, Esports",
+        "We Have Not Quite Decided",
+    )
+    assert _similar_enough("Karma Police - Remastered", "Karma Police")
+    assert _similar_enough("夢の中へ", "夢の中へ (Remastered)")
 
 
 def test_track_position_extrapolation():
@@ -208,7 +219,10 @@ async def test_fetch_genius_url_returns_song_url():
             "sections": [
                 {
                     "hits": [
-                        {"type": "song", "result": {"url": "https://genius.com/song"}},
+                        {
+                            "type": "song",
+                            "result": {"title": "a", "url": "https://genius.com/song"},
+                        },
                     ]
                 }
             ]
@@ -230,11 +244,40 @@ async def test_fetch_genius_url_returns_none_when_no_song():
 
 
 @pytest.mark.anyio
+async def test_fetch_genius_url_skips_unrelated_automatic_hit():
+    payload = {
+        "response": {"sections": [{"hits": [{
+            "type": "song",
+            "result": {"title": "Totally Different", "url": "https://genius.com/wrong"},
+        }]}]}
+    }
+    client = _FakeClient(payload)
+    track = Track(title="Karma Police", artist="Radiohead")
+    assert await fetch_genius_url(client, track) is None
+
+
+@pytest.mark.anyio
+async def test_fetch_genius_url_accepts_manual_query_result():
+    payload = {
+        "response": {"sections": [{"hits": [{
+            "type": "song",
+            "result": {"title": "Different API Label", "url": "https://genius.com/chosen"},
+        }]}]}
+    }
+    client = _FakeClient(payload)
+    url = await fetch_genius_url(
+        client, Track(title="bad metadata", artist=""), query="Radiohead Karma Police"
+    )
+    assert url == "https://genius.com/chosen"
+    assert client.calls[0][1] == {"q": "Radiohead Karma Police"}
+
+
+@pytest.mark.anyio
 async def test_load_genius_url_sets_url_for_current_track():
     payload = {
         "response": {
             "sections": [
-                {"hits": [{"type": "song", "result": {"url": "https://genius.com/x"}}]}
+                {"hits": [{"type": "song", "result": {"title": "a", "url": "https://genius.com/x"}}]}
             ]
         }
     }
@@ -252,7 +295,7 @@ async def test_load_genius_url_ignores_stale_track():
     payload = {
         "response": {
             "sections": [
-                {"hits": [{"type": "song", "result": {"url": "https://genius.com/x"}}]}
+                {"hits": [{"type": "song", "result": {"title": "old", "url": "https://genius.com/x"}}]}
             ]
         }
     }
@@ -262,6 +305,38 @@ async def test_load_genius_url_ignores_stale_track():
         app.track = Track(title="new", artist="new")
         await app.load_genius_url(Track(title="old", artist="old"))
         assert app.genius_url is None
+
+
+@pytest.mark.anyio
+async def test_manual_search_cancels_automatic_genius_lookup(monkeypatch):
+    app = Croon()
+    async with app.run_test():
+        track = Track(title="bad metadata", artist="")
+        app.track = track
+        automatic_started = asyncio.Event()
+
+        async def automatic_lookup(_track):
+            automatic_started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                app.genius_url = "https://genius.com/automatic"
+                raise
+
+        async def manual_lookup(_track, query=None):
+            app.genius_url = "https://genius.com/manual"
+
+        app._genius_task = asyncio.create_task(automatic_lookup(track))
+        await automatic_started.wait()
+        monkeypatch.setattr(app, "load_lyrics", manual_lookup)
+
+        search = app.query_one("#search", Input)
+        search.value = "Radiohead Karma Police"
+        app.on_input_submitted(Input.Submitted(search, search.value))
+        await asyncio.sleep(0)
+
+        assert app._genius_task is None
+        assert app.genius_url == "https://genius.com/manual"
 
 
 @pytest.mark.anyio
